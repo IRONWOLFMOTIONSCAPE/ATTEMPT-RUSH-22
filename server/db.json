@@ -1,0 +1,24 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "name": "John Doe",
+      "email": "john@ironwolf.com",
+      "role": "Manager",
+      "department": "Production",
+      "status": "Active",
+      "lastActive": "2 hours ago",
+      "image": "👨‍💼"
+    },
+    {
+      "id": 2,
+      "name": "Jane Smith",
+      "email": "jane@ironwolf.com",
+      "role": "Layout Artist",
+      "department": "Design",
+      "status": "Active",
+      "lastActive": "1 hour ago",
+      "image": "👩‍🎨"
+    }
+  ]
+}
