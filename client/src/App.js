@@ -2,8 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Toaster, toast } from 'react-hot-toast';
-import { db, syncStatus } from './firebase';
+import { db } from './firebase';
 import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, serverTimestamp } from 'firebase/firestore';
+import { syncEngine } from './utils/syncEngine';
 import './App.css';
 
 // Initial users data
@@ -421,24 +422,9 @@ function UserManagement({ users, setUsers }) {
 
   const handleAddUser = async () => {
     try {
-      const docRef = await addDoc(collection(db, 'users'), {
+      await syncEngine.updateData('users', {
         ...formData,
         lastActive: 'Just now'
-      });
-      const addedUser = {
-        id: docRef.id,
-        ...formData,
-        lastActive: 'Just now'
-      };
-      setUsers([...users, addedUser]);
-      setIsAddingUser(false);
-      setFormData({
-        name: '',
-        email: '',
-        role: 'Layout Artist',
-        department: '',
-        status: 'Active',
-        image: '👤'
       });
       toast.success('User added successfully!');
     } catch (error) {
@@ -449,8 +435,10 @@ function UserManagement({ users, setUsers }) {
 
   const handleEditUser = async () => {
     try {
-      const userRef = doc(db, 'users', editingUser.id);
-      await updateDoc(userRef, formData);
+      await syncEngine.updateData('users', {
+        id: editingUser.id,
+        ...formData
+      });
       setUsers(users.map(user => user.id === editingUser.id ? { ...user, ...formData } : user));
       setEditingUser(null);
       setFormData({
@@ -470,7 +458,7 @@ function UserManagement({ users, setUsers }) {
 
   const handleDeleteUser = async (userId) => {
     try {
-      await deleteDoc(doc(db, 'users', userId));
+      await syncEngine.deleteData('users', userId);
       setUsers(users.filter(user => user.id !== userId));
       toast.success('User deleted successfully!');
     } catch (error) {
@@ -667,14 +655,14 @@ function UserManagement({ users, setUsers }) {
               </div>
             </form>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 };
 
 // Dashboard Component
-function Dashboard({ user, onLogout, users, setUsers, syncState }) {
+function Dashboard({ user, onLogout, users, setUsers, syncStatus }) {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [currentPage, setCurrentPage] = useState('Home');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -881,56 +869,38 @@ function App() {
   const [users, setUsers] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [syncState, setSyncState] = useState({ isOnline: true, lastSync: new Date() });
+  const [syncStatus, setSyncStatus] = useState({ isOnline: true });
 
   useEffect(() => {
-    // Monitor sync status
-    const syncInterval = setInterval(() => {
-      setSyncState(syncStatus);
-    }, 1000);
+    // Initial data load
+    const loadData = async () => {
+      const userData = await syncEngine.getData('users');
+      setUsers(userData);
+    };
+    loadData();
 
-    // Set up real-time listener with enhanced sync
-    const usersQuery = query(collection(db, 'users'), orderBy('lastActive', 'desc'));
-    const unsubscribe = onSnapshot(usersQuery, 
-      (snapshot) => {
-        const usersData = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-          _syncTimestamp: serverTimestamp()
-        }));
-        
-        setUsers(usersData);
-        syncStatus.lastSync = new Date();
-      },
-      (error) => {
-        console.error('Error fetching users:', error);
-        toast.error('Failed to sync users data');
-      },
-      // Enhanced sync options
-      {
-        includeMetadataChanges: true // This allows us to detect local vs server changes
-      }
-    );
+    // Set up sync status monitoring
+    const checkSyncStatus = () => {
+      setSyncStatus({ isOnline: syncEngine.getOnlineStatus() });
+    };
+    
+    const interval = setInterval(checkSyncStatus, 1000);
+    window.addEventListener('online', checkSyncStatus);
+    window.addEventListener('offline', checkSyncStatus);
 
-    // Cleanup
     return () => {
-      clearInterval(syncInterval);
-      unsubscribe();
+      clearInterval(interval);
+      window.removeEventListener('online', checkSyncStatus);
+      window.removeEventListener('offline', checkSyncStatus);
     };
   }, []);
 
   const handleAddUser = async (newUser) => {
     try {
-      const docRef = await addDoc(collection(db, 'users'), {
+      await syncEngine.updateData('users', {
         ...newUser,
         lastActive: 'Just now'
       });
-      const addedUser = {
-        id: docRef.id,
-        ...newUser,
-        lastActive: 'Just now'
-      };
-      setUsers([...users, addedUser]);
       toast.success('User added successfully');
     } catch (error) {
       console.error('Error adding user:', error);
@@ -940,9 +910,10 @@ function App() {
 
   const handleUpdateUser = async (id, updatedUser) => {
     try {
-      const userRef = doc(db, 'users', id);
-      await updateDoc(userRef, updatedUser);
-      setUsers(users.map(user => user.id === id ? { ...user, ...updatedUser } : user));
+      await syncEngine.updateData('users', {
+        id,
+        ...updatedUser
+      });
       toast.success('User updated successfully');
     } catch (error) {
       console.error('Error updating user:', error);
@@ -952,8 +923,7 @@ function App() {
 
   const handleDeleteUser = async (id) => {
     try {
-      await deleteDoc(doc(db, 'users', id));
-      setUsers(users.filter(user => user.id !== id));
+      await syncEngine.deleteData('users', id);
       toast.success('User deleted successfully');
     } catch (error) {
       console.error('Error deleting user:', error);
@@ -977,13 +947,13 @@ function App() {
   // Add sync status indicator
   const SyncIndicator = () => (
     <div className={`fixed bottom-4 right-4 flex items-center space-x-2 px-3 py-2 rounded-full ${
-      syncState.isOnline ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+      syncStatus.isOnline ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
     }`}>
       <div className={`w-2 h-2 rounded-full ${
-        syncState.isOnline ? 'bg-green-500' : 'bg-red-500'
+        syncStatus.isOnline ? 'bg-green-500' : 'bg-red-500'
       }`} />
       <span className="text-sm">
-        {syncState.isOnline ? 'Synced' : 'Offline'}
+        {syncStatus.isOnline ? 'Synced' : 'Offline'}
       </span>
     </div>
   );
@@ -1002,7 +972,7 @@ function App() {
           onLogout={handleLogout}
           users={users}
           setUsers={setUsers}
-          syncState={syncState}
+          syncStatus={syncStatus}
         />
       )}
     </div>
