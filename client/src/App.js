@@ -931,17 +931,17 @@ function App() {
     }
   };
 
-  const handleLogin = () => {
+  const handleLogin = (user) => {
     setIsAuthenticated(true);
+  };
+
+  const handleLogout = () => {
+    setIsAuthenticated(false);
+    setSelectedUser(null);
   };
 
   const handleUserSelect = (user) => {
     setSelectedUser(user);
-  };
-
-  const handleLogout = () => {
-    setSelectedUser(null);
-    toast.success('Logged out successfully!');
   };
 
   // Add sync status indicator
@@ -959,21 +959,23 @@ function App() {
   );
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gray-100">
       <Toaster position="top-right" />
-      <SyncIndicator />
       {!isAuthenticated ? (
         <Login onLogin={handleLogin} />
       ) : !selectedUser ? (
         <UserSelection users={users} onSelectUser={handleUserSelect} />
       ) : (
-        <Dashboard 
-          user={selectedUser} 
-          onLogout={handleLogout}
-          users={users}
-          setUsers={setUsers}
-          syncStatus={syncStatus}
-        />
+        <>
+          <Dashboard 
+            user={selectedUser} 
+            onLogout={handleLogout}
+            users={users}
+            setUsers={setUsers}
+            syncStatus={syncStatus}
+          />
+          <SyncIndicator />
+        </>
       )}
     </div>
   );
