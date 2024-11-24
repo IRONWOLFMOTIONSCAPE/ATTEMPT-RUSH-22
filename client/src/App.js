@@ -2,8 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Toaster, toast } from 'react-hot-toast';
-import { db } from './firebase';
-import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, onSnapshot } from 'firebase/firestore';
+import { db, syncStatus } from './firebase';
+import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, serverTimestamp } from 'firebase/firestore';
 import './App.css';
 
 // Initial users data
@@ -674,7 +674,7 @@ function UserManagement({ users, setUsers }) {
 };
 
 // Dashboard Component
-function Dashboard({ user, onLogout, users, setUsers }) {
+function Dashboard({ user, onLogout, users, setUsers, syncState }) {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [currentPage, setCurrentPage] = useState('Home');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -881,45 +881,42 @@ function App() {
   const [users, setUsers] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [syncState, setSyncState] = useState({ isOnline: true, lastSync: new Date() });
 
   useEffect(() => {
-    // Set up real-time listener for users
-    const unsubscribe = onSnapshot(collection(db, 'users'), (snapshot) => {
-      const usersData = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      
-      // If no users exist, add initial users
-      if (usersData.length === 0) {
-        console.log('No users found, adding initial users...');
-        const addInitialUsers = async () => {
-          for (const user of initialUsers) {
-            try {
-              await addDoc(collection(db, 'users'), user);
-            } catch (error) {
-              console.error('Error adding initial user:', error);
-            }
-          }
-          // Fetch users again after adding initial data
-          const newSnapshot = await getDocs(collection(db, 'users'));
-          const newUsersData = newSnapshot.docs.map(doc => ({
-            id: doc.id,
-            ...doc.data()
-          }));
-          setUsers(newUsersData);
-        };
-        addInitialUsers();
-      } else {
-        setUsers(usersData);
-      }
-    }, (error) => {
-      console.error('Error fetching users:', error);
-      toast.error('Failed to load users');
-    });
+    // Monitor sync status
+    const syncInterval = setInterval(() => {
+      setSyncState(syncStatus);
+    }, 1000);
 
-    // Cleanup subscription on unmount
-    return () => unsubscribe();
+    // Set up real-time listener with enhanced sync
+    const usersQuery = query(collection(db, 'users'), orderBy('lastActive', 'desc'));
+    const unsubscribe = onSnapshot(usersQuery, 
+      (snapshot) => {
+        const usersData = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+          _syncTimestamp: serverTimestamp()
+        }));
+        
+        setUsers(usersData);
+        syncStatus.lastSync = new Date();
+      },
+      (error) => {
+        console.error('Error fetching users:', error);
+        toast.error('Failed to sync users data');
+      },
+      // Enhanced sync options
+      {
+        includeMetadataChanges: true // This allows us to detect local vs server changes
+      }
+    );
+
+    // Cleanup
+    return () => {
+      clearInterval(syncInterval);
+      unsubscribe();
+    };
   }, []);
 
   const handleAddUser = async (newUser) => {
@@ -977,9 +974,24 @@ function App() {
     toast.success('Logged out successfully!');
   };
 
+  // Add sync status indicator
+  const SyncIndicator = () => (
+    <div className={`fixed bottom-4 right-4 flex items-center space-x-2 px-3 py-2 rounded-full ${
+      syncState.isOnline ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+    }`}>
+      <div className={`w-2 h-2 rounded-full ${
+        syncState.isOnline ? 'bg-green-500' : 'bg-red-500'
+      }`} />
+      <span className="text-sm">
+        {syncState.isOnline ? 'Synced' : 'Offline'}
+      </span>
+    </div>
+  );
+
   return (
     <div className="min-h-screen bg-gray-50">
       <Toaster position="top-right" />
+      <SyncIndicator />
       {!isAuthenticated ? (
         <Login onLogin={handleLogin} />
       ) : !selectedUser ? (
@@ -990,6 +1002,7 @@ function App() {
           onLogout={handleLogout}
           users={users}
           setUsers={setUsers}
+          syncState={syncState}
         />
       )}
     </div>
