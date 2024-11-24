@@ -6,7 +6,10 @@ import {
   enableMultiTabIndexedDbPersistence,
   initializeFirestore,
   persistentLocalCache,
-  persistentMultipleTabManager
+  persistentMultipleTabManager,
+  disableNetwork,
+  enableNetwork,
+  waitForPendingWrites
 } from 'firebase/firestore';
 import { getAuth, signInAnonymously } from 'firebase/auth';
 
@@ -32,54 +35,56 @@ const db = initializeFirestore(app, {
   })
 });
 
-// Enable advanced synchronization features
-try {
-  // Enable multi-tab support
-  await enableMultiTabIndexedDbPersistence(db);
-  console.log('Multi-tab persistence enabled successfully');
-} catch (err) {
-  if (err.code === 'failed-precondition') {
-    // Multiple tabs might be open
-    console.warn('Multiple tabs detected, falling back to single-tab persistence');
-    try {
-      await enableIndexedDbPersistence(db);
-      console.log('Single-tab persistence enabled as fallback');
-    } catch (singleTabError) {
-      console.error('Failed to enable persistence:', singleTabError);
+// Function to handle network state changes
+const handleNetworkState = async (online) => {
+  try {
+    if (online) {
+      await enableNetwork(db);
+      // Wait for any pending writes to complete
+      await waitForPendingWrites(db);
+      console.log('Network enabled, pending writes synced');
+    } else {
+      await disableNetwork(db);
+      console.log('Network disabled, operating in offline mode');
     }
-  } else if (err.code === 'unimplemented') {
-    console.warn('Browser doesn\'t support persistence');
+  } catch (error) {
+    console.error('Network state change error:', error);
   }
-}
-
-const auth = getAuth(app);
-
-// Sign in anonymously
-signInAnonymously(auth)
-  .then(() => {
-    console.log('Signed in anonymously');
-  })
-  .catch((error) => {
-    console.error('Anonymous auth error:', error);
-  });
-
-// Add synchronization status monitoring
-let syncStatus = {
-  isOnline: true,
-  lastSync: new Date(),
 };
 
-// Monitor online/offline status
-window.addEventListener('online', () => {
-  console.log('Application is online');
-  syncStatus.isOnline = true;
-  syncStatus.lastSync = new Date();
+// Set up network state listeners
+window.addEventListener('online', () => handleNetworkState(true));
+window.addEventListener('offline', () => handleNetworkState(false));
+
+// Enable advanced synchronization features
+const initializeSync = async () => {
+  try {
+    // Enable multi-tab support
+    await enableMultiTabIndexedDbPersistence(db);
+    console.log('Multi-tab persistence enabled successfully');
+  } catch (err) {
+    if (err.code === 'failed-precondition') {
+      // Multiple tabs might be open
+      console.warn('Multiple tabs detected, falling back to single-tab persistence');
+      try {
+        await enableIndexedDbPersistence(db);
+        console.log('Single-tab persistence enabled as fallback');
+      } catch (singleTabError) {
+        console.error('Failed to enable persistence:', singleTabError);
+      }
+    } else if (err.code === 'unimplemented') {
+      console.warn('Browser doesn\'t support persistence');
+    }
+  }
+};
+
+// Initialize sync
+initializeSync().catch(console.error);
+
+// Initialize authentication
+const auth = getAuth(app);
+signInAnonymously(auth).catch((error) => {
+  console.error('Anonymous auth error:', error);
 });
 
-window.addEventListener('offline', () => {
-  console.log('Application is offline');
-  syncStatus.isOnline = false;
-});
-
-// Export everything needed
-export { db, auth, syncStatus };
+export { db, auth };

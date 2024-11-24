@@ -1,6 +1,18 @@
 import { openDB } from 'idb';
 import { db as firebaseDB } from '../firebase';
-import { collection, onSnapshot, doc, setDoc, serverTimestamp, deleteDoc } from 'firebase/firestore';
+import { 
+  collection, 
+  onSnapshot, 
+  doc, 
+  setDoc, 
+  deleteDoc, 
+  serverTimestamp,
+  query,
+  where,
+  orderBy,
+  writeBatch,
+  getDocs
+} from 'firebase/firestore';
 
 class SyncEngine {
   constructor() {
@@ -8,6 +20,8 @@ class SyncEngine {
     this.version = 1;
     this.syncQueue = [];
     this.isOnline = navigator.onLine;
+    this.syncInProgress = false;
+    this.lastSyncTimestamp = null;
     this.initializeDB();
     this.setupEventListeners();
   }
@@ -19,9 +33,15 @@ class SyncEngine {
         if (!db.objectStoreNames.contains('users')) {
           const userStore = db.createObjectStore('users', { keyPath: 'id' });
           userStore.createIndex('lastModified', 'lastModified');
+          userStore.createIndex('syncStatus', 'syncStatus');
         }
         if (!db.objectStoreNames.contains('syncQueue')) {
-          db.createObjectStore('syncQueue', { keyPath: 'id', autoIncrement: true });
+          const syncStore = db.createObjectStore('syncQueue', { 
+            keyPath: 'id', 
+            autoIncrement: true 
+          });
+          syncStore.createIndex('timestamp', 'timestamp');
+          syncStore.createIndex('retryCount', 'retryCount');
         }
       }
     });
@@ -31,9 +51,10 @@ class SyncEngine {
   }
 
   setupEventListeners() {
-    window.addEventListener('online', () => {
+    window.addEventListener('online', async () => {
       this.isOnline = true;
-      this.processSyncQueue();
+      await this.processSyncQueue();
+      await this.fullSync();
     });
 
     window.addEventListener('offline', () => {
@@ -43,30 +64,110 @@ class SyncEngine {
 
   async startSync() {
     // Set up real-time listener for Firebase changes
-    onSnapshot(collection(firebaseDB, 'users'), async (snapshot) => {
+    const usersCollection = collection(firebaseDB, 'users');
+    const q = query(usersCollection, orderBy('lastModified', 'desc'));
+
+    onSnapshot(q, async (snapshot) => {
       if (!this.isOnline) return;
 
+      const batch = [];
       const changes = snapshot.docChanges();
+      
       for (const change of changes) {
-        const data = { ...change.doc.data(), id: change.doc.id };
-        await this.updateLocalDB(data);
+        const data = { 
+          ...change.doc.data(), 
+          id: change.doc.id,
+          syncStatus: 'synced',
+          lastSyncTimestamp: Date.now()
+        };
+
+        if (change.type === 'modified' || change.type === 'added') {
+          batch.push({ type: 'put', data });
+        } else if (change.type === 'removed') {
+          batch.push({ type: 'delete', id: change.doc.id });
+        }
+      }
+
+      if (batch.length > 0) {
+        await this.processBatch(batch);
       }
     });
   }
 
-  async updateLocalDB(data) {
+  async processBatch(batch) {
     const tx = this.db.transaction('users', 'readwrite');
-    await tx.store.put({
-      ...data,
-      lastModified: Date.now()
-    });
+    try {
+      for (const operation of batch) {
+        if (operation.type === 'put') {
+          await tx.store.put(operation.data);
+        } else if (operation.type === 'delete') {
+          await tx.store.delete(operation.id);
+        }
+      }
+      await tx.done;
+    } catch (error) {
+      console.error('Error processing batch:', error);
+      await tx.abort();
+    }
+  }
+
+  async fullSync() {
+    if (!this.isOnline || this.syncInProgress) return;
+
+    try {
+      this.syncInProgress = true;
+      const localData = await this.getData('users');
+      const serverData = await this.getServerData();
+
+      const batch = [];
+      const serverMap = new Map(serverData.map(item => [item.id, item]));
+      const localMap = new Map(localData.map(item => [item.id, item]));
+
+      // Find items to update or add
+      for (const [id, serverItem] of serverMap) {
+        const localItem = localMap.get(id);
+        if (!localItem || serverItem.lastModified > localItem.lastModified) {
+          batch.push({ type: 'put', data: serverItem });
+        }
+      }
+
+      // Find items to delete
+      for (const [id, localItem] of localMap) {
+        if (!serverMap.has(id)) {
+          batch.push({ type: 'delete', id });
+        }
+      }
+
+      if (batch.length > 0) {
+        await this.processBatch(batch);
+      }
+
+      this.lastSyncTimestamp = Date.now();
+    } catch (error) {
+      console.error('Full sync error:', error);
+    } finally {
+      this.syncInProgress = false;
+    }
+  }
+
+  async getServerData() {
+    const usersCollection = collection(firebaseDB, 'users');
+    const q = query(usersCollection, orderBy('lastModified', 'desc'));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => ({
+      ...doc.data(),
+      id: doc.id,
+      syncStatus: 'synced',
+      lastSyncTimestamp: Date.now()
+    }));
   }
 
   async addToSyncQueue(operation) {
     const tx = this.db.transaction('syncQueue', 'readwrite');
     await tx.store.add({
       ...operation,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      retryCount: 0
     });
 
     if (this.isOnline) {
@@ -80,25 +181,51 @@ class SyncEngine {
     const tx = this.db.transaction('syncQueue', 'readwrite');
     const queue = await tx.store.getAll();
 
+    // Sort by timestamp and retry count
+    queue.sort((a, b) => {
+      if (a.retryCount === b.retryCount) {
+        return a.timestamp - b.timestamp;
+      }
+      return a.retryCount - b.retryCount;
+    });
+
+    const batch = writeBatch(firebaseDB);
+    const processedIds = [];
+
     for (const operation of queue) {
       try {
         const docRef = doc(firebaseDB, 'users', operation.data.id);
         
         if (operation.type === 'DELETE') {
-          await deleteDoc(docRef);
+          batch.delete(docRef);
         } else {
-          await setDoc(docRef, {
+          batch.set(docRef, {
             ...operation.data,
             lastModified: serverTimestamp()
           });
         }
         
-        await tx.store.delete(operation.id);
+        processedIds.push(operation.id);
       } catch (error) {
         console.error('Sync error:', error);
-        // Keep the operation in queue if it fails
-        continue;
+        // Update retry count
+        await tx.store.put({
+          ...operation,
+          retryCount: (operation.retryCount || 0) + 1
+        });
       }
+    }
+
+    try {
+      if (processedIds.length > 0) {
+        await batch.commit();
+        // Remove processed operations
+        for (const id of processedIds) {
+          await tx.store.delete(id);
+        }
+      }
+    } catch (error) {
+      console.error('Batch commit error:', error);
     }
   }
 
@@ -120,11 +247,20 @@ class SyncEngine {
       await this.addToSyncQueue({
         type: 'UPDATE',
         store: storeName,
-        data
+        data: {
+          ...data,
+          lastModified: Date.now(),
+          syncStatus: 'pending'
+        }
       });
 
       // Update local DB immediately
-      await this.updateLocalDB(data);
+      const tx = this.db.transaction(storeName, 'readwrite');
+      await tx.store.put({
+        ...data,
+        lastModified: Date.now(),
+        syncStatus: 'pending'
+      });
     } catch (error) {
       console.error(`Error updating data in ${storeName}:`, error);
       throw error;
@@ -149,7 +285,11 @@ class SyncEngine {
   }
 
   getOnlineStatus() {
-    return this.isOnline;
+    return {
+      isOnline: this.isOnline,
+      lastSync: this.lastSyncTimestamp,
+      syncInProgress: this.syncInProgress
+    };
   }
 }
 
